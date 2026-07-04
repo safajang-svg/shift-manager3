@@ -238,8 +238,8 @@ function keyOf(y,m,d,slot){ return `${y}-${m}-${d}-${slot}`; }
 function newId(){ return `${Date.now()}-${Math.random().toString(36).slice(2,7)}`; }
 
 // ---------- persistence (Google Sheets via Apps Script web app) ----------
-const SHEET_API_URL = "https://script.google.com/macros/s/AKfycbyZetKHaWha7bE589P5Sbqtrf3WmMBqMKMqRINnvSTrWYvvMvDgN1dE47u95nCf2nSWPQ/exec";
-const STORAGE_KEY = "shift-manager-entries-v1"; // local backup, used if the sheet is unreachable
+const SHEET_API_URL = "https://script.google.com/macros/s/AKfycbxSPfdSutk_XDEdKJkh4iCI0iN0OHCl1NbsaQ0P265SDD4t_jaDNRu5R9fBFXi7wCOT/exec";
+const STORAGE_KEY = "shift-manager3-entries-v1"; // local backup, used if the sheet is unreachable
 
 function isRemoteConfigured(){
   return typeof SHEET_API_URL === "string" && SHEET_API_URL.startsWith("http");
