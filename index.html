@@ -72,6 +72,24 @@
     color:#c53030; font-size:12px; font-weight:700; cursor:pointer;
     padding:3px 8px; border:1px solid #f3c9c9; border-radius:7px; background:#fff5f5; flex-shrink:0;
   }
+  .badge.swap-origin{ box-shadow: 0 0 0 3px #111; }
+  .badge.blink-candidate{
+    animation: candidateBlink 1s ease-in-out infinite;
+    box-shadow: 0 0 0 3px #ffd400;
+  }
+  @keyframes candidateBlink{
+    0%,100%{ filter:brightness(1); }
+    50%{ filter:brightness(1.55); }
+  }
+  .swap-banner{
+    display:none; position:fixed; top:10px; left:50%; transform:translateX(-50%);
+    background:#111; color:#fff; padding:10px 14px; border-radius:11px; font-size:13px;
+    font-weight:700; z-index:70; align-items:center; gap:10px; max-width:90vw; text-align:center;
+  }
+  .swap-banner button{
+    background:#fff; color:#111; border:none; border-radius:7px; padding:5px 10px;
+    font-weight:700; cursor:pointer; font-size:12px; flex-shrink:0;
+  }
 
   /* modal */
   .overlay{
@@ -116,14 +134,31 @@
   .chip .ic{font-size:20px; line-height:1;}
   .chip.selected{border-color:var(--blue); background:#eaf1ff; color:var(--blue);}
   .chip:active{transform:scale(0.96);}
+  .chip.disabled{
+    opacity:0.35; cursor:not-allowed; background:#f2f2f2; color:#9aa0aa;
+    animation:none; box-shadow:none;
+  }
   .team-group{margin-bottom:8px;}
   .team-label{
     display:inline-block; font-size:11px; font-weight:800; color:#fff;
     padding:2px 8px; border-radius:6px; margin-bottom:4px;
   }
+  .hours-summary{
+    background:#eef4ff; padding:2px 6px !important; border:1px solid var(--line);
+    text-align:center; line-height:1.3; height:auto !important; width:auto !important;
+  }
+  .hours-chip{
+    display:inline-block; font-size:9.5px; font-weight:700; color:#33507a;
+    margin:0 5px;
+  }
+  .hours-chip.over{ color:#c53030; }
 </style>
 </head>
 <body>
+<div class="swap-banner" id="swapBanner">
+  <span id="swapBannerText"></span>
+  <button id="swapCancelBtn">취소</button>
+</div>
 <div class="zoom-bar">
   <button id="zoomOut">🔍－</button>
   <span class="pct" id="zoomPct">150%</span>
@@ -233,9 +268,131 @@ const today = new Date();
 let viewYear = today.getFullYear(), viewMonth = today.getMonth(); // 0-indexed month
 // key: "y-m-d-slot" -> array of {id, type:'vacation', name, vtype} or {id, type:'swap', from, to}
 const entries = {};
+let pendingSwap = null; // {y,m,d,slot,team} of the swap origin while picking a target date
 
 function keyOf(y,m,d,slot){ return `${y}-${m}-${d}-${slot}`; }
 function newId(){ return `${Date.now()}-${Math.random().toString(36).slice(2,7)}`; }
+
+// ---------- weekly hour rules (day shift=8h, night shift=12h, 52h/week cap) ----------
+function shiftHours(slot){ return slot === 0 ? 8 : 12; } // slot0=주간(day), slot1=야간(night)
+
+function mondayOfWeek(y,m,d){
+  const dt = new Date(Date.UTC(y,m,d));
+  const dow = dt.getUTCDay(); // 0=Sun..6=Sat
+  const diff = (dow === 0) ? -6 : (1 - dow);
+  dt.setUTCDate(dt.getUTCDate() + diff);
+  return {y: dt.getUTCFullYear(), m: dt.getUTCMonth(), d: dt.getUTCDate()};
+}
+
+function weekDatesFrom(monday){
+  const arr = [];
+  const dt = new Date(Date.UTC(monday.y, monday.m, monday.d));
+  for(let i=0;i<7;i++){
+    arr.push({y:dt.getUTCFullYear(), m:dt.getUTCMonth(), d:dt.getUTCDate()});
+    dt.setUTCDate(dt.getUTCDate()+1);
+  }
+  return arr;
+}
+
+// Person's total scheduled hours (Mon-Sun) for the week containing the given Monday,
+// including base team schedule plus any registered vacation (subtract) / swap (from:subtract, to:add) adjustments.
+function weeklyHoursForPerson(name, monday){
+  const days = weekDatesFrom(monday);
+  let total = 0;
+  days.forEach(day => {
+    const teams = teamsFor(day.y, day.m, day.d);
+    [0,1].forEach(slot => {
+      const team = teams[slot];
+      const hrs = shiftHours(slot);
+      if(TEAM_MEMBERS[team] && TEAM_MEMBERS[team].includes(name)){
+        total += hrs;
+      }
+      const list = entries[keyOf(day.y, day.m, day.d, slot)] || [];
+      list.forEach(ex => {
+        if(ex.type === "vacation" && ex.name === name){
+          total -= hrs;
+        } else if(ex.type === "swap"){
+          if(ex.from === name) total -= hrs;
+          if(ex.to === name) total += hrs;
+        }
+      });
+    });
+  });
+  return total;
+}
+
+function isSameIsoWeek(y1,m1,d1,y2,m2,d2){
+  const w1 = mondayOfWeek(y1,m1,d1);
+  const w2 = mondayOfWeek(y2,m2,d2);
+  return w1.y === w2.y && w1.m === w2.m && w1.d === w2.d;
+}
+
+function teamHasMondayOff(team, monday){
+  const t = teamsFor(monday.y, monday.m, monday.d);
+  return t[0] !== team && t[1] !== team;
+}
+
+// Simulate a two-way swap (origin<->target) for a specific requester/partner pair by
+// temporarily registering both mirrored entries, checking the 52h/week cap for both
+// people in both affected weeks, then rolling the temporary entries back.
+function simulateSwapValid(origin, target, requesterName, partnerName){
+  const kOrigin = keyOf(origin.y, origin.m, origin.d, origin.slot);
+  const kTarget = keyOf(target.y, target.m, target.d, target.slot);
+  const tmpO = "__sim__" + newId();
+  const tmpT = "__sim__" + newId();
+
+  if(!entries[kOrigin]) entries[kOrigin] = [];
+  if(!entries[kTarget]) entries[kTarget] = [];
+  entries[kOrigin].push({id: tmpO, type: "swap", from: requesterName, to: partnerName});
+  entries[kTarget].push({id: tmpT, type: "swap", from: partnerName, to: requesterName});
+
+  const mondayOrigin = mondayOfWeek(origin.y, origin.m, origin.d);
+  const mondayTarget = mondayOfWeek(target.y, target.m, target.d);
+
+  const ok =
+    weeklyHoursForPerson(requesterName, mondayOrigin) <= 52 &&
+    weeklyHoursForPerson(partnerName, mondayOrigin) <= 52 &&
+    weeklyHoursForPerson(requesterName, mondayTarget) <= 52 &&
+    weeklyHoursForPerson(partnerName, mondayTarget) <= 52;
+
+  entries[kOrigin] = entries[kOrigin].filter(e => e.id !== tmpO);
+  entries[kTarget] = entries[kTarget].filter(e => e.id !== tmpT);
+  if(entries[kOrigin].length === 0) delete entries[kOrigin];
+  if(entries[kTarget].length === 0) delete entries[kTarget];
+
+  return ok;
+}
+
+// Is (y,m,d,slot,team) a valid swap-target candidate for the current pendingSwap origin?
+// Rules:
+//  - same shift type (day/night), a different team than the origin
+//  - must be within the same calendar month as the origin date, and not before today
+//  - same week as origin: any other team is eligible (day-day / night-night)
+//  - different week: only a team that has that week's Monday off is eligible
+//  - and (always) the swap must not push either person over 52h in either affected week
+function isValidSwapCandidate(y,m,d,slot,team){
+  if(!pendingSwap) return false;
+  if(slot !== pendingSwap.slot) return false;
+  if(team === pendingSwap.team) return false;
+
+  const origin = pendingSwap;
+  if(y !== origin.y || m !== origin.m) return false; // same month only
+
+  const t0 = Date.UTC(today.getFullYear(), today.getMonth(), today.getDate());
+  const cand = Date.UTC(y,m,d);
+  if(cand < t0) return false;
+
+  const sameWeek = isSameIsoWeek(origin.y, origin.m, origin.d, y, m, d);
+  if(!sameWeek){
+    const monday = mondayOfWeek(y,m,d);
+    if(!teamHasMondayOff(team, monday)) return false;
+  }
+
+  const target = {y,m,d,slot};
+  return TEAM_MEMBERS[origin.team].some(req =>
+    TEAM_MEMBERS[team].some(part => simulateSwapValid(origin, target, req, part))
+  );
+}
 
 // ---------- persistence (Google Sheets via Apps Script web app) ----------
 const SHEET_API_URL = "https://script.google.com/macros/s/AKfycbxSPfdSutk_XDEdKJkh4iCI0iN0OHCl1NbsaQ0P265SDD4t_jaDNRu5R9fBFXi7wCOT/exec";
@@ -354,17 +511,36 @@ function render(){
           const line = document.createElement("span");
           line.className = "entry-line";
           if(ex.type === "swap"){
-            line.textContent = `교대 ${ex.from}→${ex.to}`;
+            if(ex.mirrorM !== undefined && ex.mirrorD !== undefined){
+              line.textContent = `교대 ${cell.m+1}/${cell.d} ${ex.from}→${ex.mirrorM+1}/${ex.mirrorD} ${ex.to}`;
+            } else {
+              line.textContent = `교대 ${ex.from}→${ex.to}`;
+            }
           } else {
             line.textContent = `${ex.name} ${ex.vtype}`;
           }
           badge.appendChild(line);
         });
 
-        if(!cell.other){
+        if(cell.other) badge.style.opacity = "0.55";
+
+        const isOrigin = pendingSwap &&
+          cell.y === pendingSwap.y && cell.m === pendingSwap.m && cell.d === pendingSwap.d &&
+          slot === pendingSwap.slot && team === pendingSwap.team;
+        const isCandidate = !isOrigin && isValidSwapCandidate(cell.y, cell.m, cell.d, slot, team);
+
+        if(isOrigin) badge.classList.add("swap-origin");
+        if(isCandidate) badge.classList.add("blink-candidate");
+
+        if(pendingSwap){
+          if(isOrigin){
+            badge.addEventListener("click", () => { pendingSwap = null; render(); });
+          } else if(isCandidate){
+            badge.addEventListener("click", () => finalizeSwapPick(cell.y, cell.m, cell.d, slot, team));
+          }
+          // other badges are inert while picking a swap target
+        } else if(!cell.other){
           badge.addEventListener("click", () => openMenu(cell.y, cell.m, cell.d, slot, team));
-        } else {
-          badge.style.opacity = "0.55";
         }
         td.appendChild(badge);
       });
@@ -372,6 +548,31 @@ function render(){
       tr.appendChild(td);
     }
     body.appendChild(tr);
+
+    // weekly hours summary row (Mon-Sun), one line per person: "이름 : N시간"
+    const mondayCell = cells[w*7];
+    const monday = {y: mondayCell.y, m: mondayCell.m, d: mondayCell.d};
+    const hoursRow = document.createElement("tr");
+    const hoursTd = document.createElement("td");
+    hoursTd.colSpan = 7;
+    hoursTd.className = "hours-summary";
+    const allNames = Object.values(TEAM_MEMBERS).flat();
+    hoursTd.innerHTML = allNames.map(n => {
+      const h = weeklyHoursForPerson(n, monday);
+      const over = h > 52 ? " over" : "";
+      return `<span class="hours-chip${over}">${n} : ${h}시간</span>`;
+    }).join("");
+    hoursRow.appendChild(hoursTd);
+    body.appendChild(hoursRow);
+  }
+
+  const banner = document.getElementById("swapBanner");
+  const bannerText = document.getElementById("swapBannerText");
+  if(pendingSwap){
+    banner.style.display = "flex";
+    bannerText.textContent = `${pendingSwap.m+1}월 ${pendingSwap.d}일 · ${pendingSwap.team} 교대 대상을 선택하세요 (깜빡이는 조를 탭)`;
+  } else {
+    banner.style.display = "none";
   }
 }
 
@@ -409,8 +610,13 @@ function wireChipGroup(groupId, onPick){
   });
 }
 
-function entryLabel(ex){
-  if(ex.type === "swap") return `교대 ${ex.from}→${ex.to}`;
+function entryLabel(ex, m, d){
+  if(ex.type === "swap"){
+    if(ex.mirrorM !== undefined && ex.mirrorD !== undefined){
+      return `교대 ${m+1}/${d} ${ex.from}→${ex.mirrorM+1}/${ex.mirrorD} ${ex.to}`;
+    }
+    return `교대 ${ex.from}→${ex.to}`;
+  }
   return `${ex.name} · ${ex.vtype}`;
 }
 
@@ -422,7 +628,7 @@ function openMenu(y, m, d, slot, team){
     <div class="entry-list">
       ${list.map(ex => `
         <div class="entry-item">
-          <span class="txt">${entryLabel(ex)}</span>
+          <span class="txt">${entryLabel(ex, m, d)}</span>
           <span class="del" data-id="${ex.id}">삭제</span>
         </div>
       `).join("")}
@@ -447,8 +653,20 @@ function openMenu(y, m, d, slot, team){
   document.getElementById("btnSwap").onclick = () => openSwapForm(y,m,d,slot,team);
   modalBox.querySelectorAll(".del").forEach(el => {
     el.onclick = () => {
+      const target = (entries[k] || []).find(ex => ex.id === el.dataset.id);
       entries[k] = (entries[k] || []).filter(ex => ex.id !== el.dataset.id);
       if(entries[k].length === 0) delete entries[k];
+
+      // a swap has a mirrored entry on the other date; remove that too
+      if(target && target.type === "swap" && target.mirrorM !== undefined && target.mirrorD !== undefined){
+        const mk = keyOf(target.mirrorY, target.mirrorM, target.mirrorD, slot);
+        entries[mk] = (entries[mk] || []).filter(ex =>
+          !(ex.type === "swap" && ex.from === target.to && ex.to === target.from &&
+            ex.mirrorM === m && ex.mirrorD === d)
+        );
+        if(entries[mk] && entries[mk].length === 0) delete entries[mk];
+      }
+
       saveEntries();
       render();
       openMenu(y,m,d,slot,team);
@@ -492,51 +710,103 @@ function openVacationForm(y,m,d,slot,team){
 }
 
 function openSwapForm(y,m,d,slot,team){
-  const k = keyOf(y,m,d,slot);
-  const requesterPool = TEAM_MEMBERS[team];              // same team as the clicked badge
-  const otherTeams = Object.keys(TEAM_MEMBERS).filter(t => t !== team); // the other two teams
+  // Enter "swap-picking mode": close the modal, blink valid target dates on the
+  // calendar itself, and let the user tap one to finalize the exchange.
+  pendingSwap = {y,m,d,slot,team};
+  closeModal();
+  render();
+}
+
+function finalizeSwapPick(ty,tm,td,tslot,tteam){
+  const origin = pendingSwap;
+  if(!origin) return;
+
+  const target = {y:ty, m:tm, d:td, slot:tslot};
+  const requesterPool = TEAM_MEMBERS[origin.team];
+  const partnerPool = TEAM_MEMBERS[tteam];
 
   let picked = { from: null, to: null };
 
-  const partnerGroupsHtml = otherTeams.map(t => `
-    <div class="team-group">
-      <div class="team-label ${TEAM_CLASS[t]}">${t}</div>
-      <div class="chip-grid">${nameChips(TEAM_MEMBERS[t], picked.to, "swap-to")}</div>
-    </div>
-  `).join("");
+  function personChips(pool, groupId, isFrom){
+    return pool.map(n => {
+      const selected = n === (isFrom ? picked.from : picked.to);
+      let ok;
+      if(isFrom){
+        ok = picked.to ? simulateSwapValid(origin, target, n, picked.to)
+                       : partnerPool.some(p => simulateSwapValid(origin, target, n, p));
+      } else {
+        ok = picked.from ? simulateSwapValid(origin, target, picked.from, n)
+                         : requesterPool.some(r => simulateSwapValid(origin, target, r, n));
+      }
+      const cls = ["chip"];
+      if(selected) cls.push("selected");
+      if(!ok) cls.push("disabled");
+      else if(!selected) cls.push("blink-candidate");
+      return `<div class="${cls.join(" ")}" data-group="${groupId}" data-value="${n}" ${ok ? "" : 'data-disabled="1"'}>
+        <span class="ic">👤</span><span>${n}</span>
+      </div>`;
+    }).join("");
+  }
 
-  modalBox.innerHTML = `
-    <span class="back" id="back">‹ 뒤로</span>
-    <h3>${m+1}월 ${d}일 · ${team} 근무교대</h3>
-    <label>요청자 (${team})</label>
-    <div class="chip-grid">${nameChips(requesterPool, picked.from, "swap-from")}</div>
-    <label>교대자 (다른 조)</label>
-    ${partnerGroupsHtml}
-    <div class="actions">
-      <button class="btn-cancel" id="btnCancel">취소</button>
-      <button class="btn-confirm" id="btnConfirm">등록</button>
-    </div>
-  `;
-  document.getElementById("back").onclick = () => openMenu(y,m,d,slot,team);
-  document.getElementById("btnCancel").onclick = closeModal;
-  wireChipGroup("swap-from", v => picked.from = v);
-  wireChipGroup("swap-to", v => picked.to = v);
-  document.getElementById("btnConfirm").onclick = () => {
-    if(!picked.from || !picked.to){
-      alert("요청자와 교대자를 모두 선택해주세요.");
-      return;
-    }
-    if(!entries[k]) entries[k] = [];
-    entries[k].push({id: newId(), type: "swap", from: picked.from, to: picked.to});
-    saveEntries();
-    render();
-    openMenu(y,m,d,slot,team);
-  };
+  function renderModal(){
+    modalBox.innerHTML = `
+      <h3>${origin.m+1}월 ${origin.d}일 · ${origin.team} 근무교대</h3>
+      <div class="desc">교대 대상: ${tm+1}월 ${td}일 · ${tteam}</div>
+      <label>요청자 (${origin.team})</label>
+      <div class="chip-grid">${personChips(requesterPool, "fin-from", true)}</div>
+      <label>교대자 (${tteam})</label>
+      <div class="chip-grid">${personChips(partnerPool, "fin-to", false)}</div>
+      <div class="actions">
+        <button class="btn-cancel" id="btnCancel">취소</button>
+        <button class="btn-confirm" id="btnConfirm">등록</button>
+      </div>
+    `;
+    modalBox.querySelectorAll('.chip[data-group="fin-from"]').forEach(el => {
+      if(el.dataset.disabled) return;
+      el.onclick = () => { picked.from = el.dataset.value; renderModal(); };
+    });
+    modalBox.querySelectorAll('.chip[data-group="fin-to"]').forEach(el => {
+      if(el.dataset.disabled) return;
+      el.onclick = () => { picked.to = el.dataset.value; renderModal(); };
+    });
+    document.getElementById("btnCancel").onclick = () => { pendingSwap = null; closeModal(); render(); };
+    document.getElementById("btnConfirm").onclick = () => {
+      if(!picked.from || !picked.to){
+        alert("요청자와 교대자를 모두 선택해주세요.");
+        return;
+      }
+      if(!simulateSwapValid(origin, target, picked.from, picked.to)){
+        alert("이 조합은 주(월~일) 52시간 규칙을 초과합니다. 다른 사람을 선택해주세요.");
+        return;
+      }
+      const kOrigin = keyOf(origin.y, origin.m, origin.d, origin.slot);
+      const kTarget = keyOf(ty, tm, td, tslot);
+      if(!entries[kOrigin]) entries[kOrigin] = [];
+      if(!entries[kTarget]) entries[kTarget] = [];
+      entries[kOrigin].push({
+        id: newId(), type: "swap", from: picked.from, to: picked.to,
+        mirrorY: ty, mirrorM: tm, mirrorD: td
+      });
+      entries[kTarget].push({
+        id: newId(), type: "swap", from: picked.to, to: picked.from,
+        mirrorY: origin.y, mirrorM: origin.m, mirrorD: origin.d
+      });
+      saveEntries();
+      pendingSwap = null;
+      closeModal();
+      render();
+    };
+  }
+
+  overlay.classList.add("open");
+  renderModal();
 }
 
 overlay.addEventListener("click", (e) => {
   if(e.target === overlay) closeModal();
 });
+
+document.getElementById("swapCancelBtn").onclick = () => { pendingSwap = null; render(); };
 
 // ---------- nav buttons ----------
 document.getElementById("mPrev").onclick = () => { viewMonth--; if(viewMonth<0){viewMonth=11; viewYear--;} render(); };
