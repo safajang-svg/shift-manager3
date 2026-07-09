@@ -33,6 +33,10 @@
   .nav button:active{transform:scale(0.94);}
   .ttl{font-size:22px; font-weight:800;}
   .subttl{text-align:center; font-size:26px; font-weight:800; color:#2c2f8f; margin:6px 0 16px;}
+  .shift-type-label{
+    text-align:center; font-size:13px; font-weight:700; color:#697180;
+    margin:-10px 0 14px;
+  }
   table{width:100%; border-collapse:collapse; background:#fff; border-radius:10px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,.06);}
   th{padding:10px 4px; font-size:14px; color:var(--sub); border-bottom:1px solid var(--line);}
   th.sat{color:var(--blue);} th.sun{color:#d43a3a;}
@@ -175,6 +179,7 @@
     <div class="subttl" id="monthLabel" style="margin:0;">7월 근무표</div>
     <button id="mNext">›</button>
   </div>
+  <div class="shift-type-label">주야비 3조 2교대</div>
 
   <table>
     <thead>
@@ -367,9 +372,10 @@ function simulateSwapValid(origin, target, requesterName, partnerName){
 // Rules:
 //  - same shift type (day/night), a different team than the origin
 //  - must be within the same calendar month as the origin date, and not before today
-//  - same week as origin: any other team is eligible (day-day / night-night)
-//  - different week: only a team that has that week's Monday off is eligible
+//  - same month as origin, not before today
 //  - and (always) the swap must not push either person over 52h in either affected week
+//    (a same-week swap is naturally zero-sum for both people, so it always passes;
+//     a different-week swap is only valid if both people stay under 52h in both weeks)
 function isValidSwapCandidate(y,m,d,slot,team){
   if(!pendingSwap) return false;
   if(slot !== pendingSwap.slot) return false;
@@ -381,12 +387,6 @@ function isValidSwapCandidate(y,m,d,slot,team){
   const t0 = Date.UTC(today.getFullYear(), today.getMonth(), today.getDate());
   const cand = Date.UTC(y,m,d);
   if(cand < t0) return false;
-
-  const sameWeek = isSameIsoWeek(origin.y, origin.m, origin.d, y, m, d);
-  if(!sameWeek){
-    const monday = mondayOfWeek(y,m,d);
-    if(!teamHasMondayOff(team, monday)) return false;
-  }
 
   const target = {y,m,d,slot};
   return TEAM_MEMBERS[origin.team].some(req =>
